@@ -1,0 +1,19 @@
+{
+  "hosts": {
+    "demo-host": {
+      "alias": "experiment-host",
+      "allowed_root": "/data/experiments"
+    }
+  },
+  "runs": [
+    {
+      "id": "demo-run",
+      "title": "Synthetic SSH demo",
+      "source": {
+        "mode": "ssh",
+        "host": "demo-host",
+        "log_path": "/data/experiments/demo/monitor.jsonl"
+      }
+    }
+  ]
+}

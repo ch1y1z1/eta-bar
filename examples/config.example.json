@@ -1,0 +1,13 @@
+{
+  "hosts": {},
+  "runs": [
+    {
+      "id": "demo-run",
+      "title": "Synthetic demo",
+      "source": {
+        "mode": "local",
+        "log_path": "/data/experiments/demo/monitor.jsonl"
+      }
+    }
+  ]
+}

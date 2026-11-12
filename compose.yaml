@@ -1,0 +1,27 @@
+services:
+  backend:
+    build: .
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      ETA_API_TOKEN: "${ETA_API_TOKEN:?Set ETA_API_TOKEN to a random bearer token}"
+      ETA_LISTEN: "0.0.0.0:8080"
+      ETA_CONFIG: "/config/config.json"
+      ETA_DATA_DIR: "/data"
+    volumes:
+      - eta-cache:/data
+      - ./config.json:/config/config.json:ro
+      - ./demo-data:/logs:ro
+      # For SSH mode, mount a dedicated directory containing config, a dedicated
+      # key and known_hosts. Files must be readable by uid 10001, with key mode 0600.
+      # - ./ssh:/home/eta/.ssh:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+volumes:
+  eta-cache:

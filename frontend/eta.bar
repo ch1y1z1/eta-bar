@@ -1,0 +1,297 @@
+<bar protocol-version="0" id="eta-sequential-prototype" title="实验进度" version="0.2.1" description="静态合成进度示例与可选快照 API" refresh="30s">
+  <permissions>
+    <network origin="{{ inputs.baseURL }}" />
+  </permissions>
+  <inputs>
+    <input name="mode" type="select" label="数据模式" default="demo">
+      <option value="demo" label="Demo · 离线假数据" />
+      <option value="api" label="API · Go 后端" />
+    </input>
+    <input name="baseURL" type="string" label="API origin" default="" help="仅 origin，如 https://example.com 或 http://localhost:8080；禁止路径、查询、片段及凭据。Demo 无网络。" />
+    <input name="runID" type="string" label="Run ID" default="demo-run" />
+    <input name="staleSeconds" type="number" label="源快照过期秒数" default="120" />
+    <input name="etaValiditySeconds" type="number" label="ETA 独立有效秒数" default="120" />
+    <input name="token" type="secret" label="可选 Bearer token" help="仅用于请求 Authorization；不写入 URL、界面或日志。" />
+  </inputs>
+  <docs><![CDATA[默认 demo 为静态合成数据：67/150 步，剩余 23 分钟。每 30 秒或点击唯一刷新按钮更新心跳，不推进工作量。API 输入与校验见 frontend/README.md；接口对接需与 Go 后端版本匹配。]]></docs>
+  <script><![CDATA[
+const STATES = new Set(['pending', 'running', 'succeeded', 'failed', 'cancelled']);
+const METHODS = new Set(['reported', 'rate', 'historical', 'manual', 'unknown']);
+const stopped = state => state === 'failed' || state === 'cancelled';
+const terminal = state => stopped(state) || state === 'succeeded';
+const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+const number = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
+const utc = value => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(value) && Number.isFinite(Date.parse(value));
+const iso = () => new Date().toISOString();
+let snapshot = null;
+let collection = { state: 'ok', observed_at: null, last_success_at: null, error: null };
+let sourceKey = null;
+let busy = false;
+let demoStart = null;
+let demoSeq = 0;
+
+function options(env) {
+  const i = env.inputs || {};
+  return {
+    mode: i.mode === 'api' ? 'api' : 'demo',
+    baseURL: typeof i.baseURL === 'string' ? i.baseURL : '',
+    runID: typeof i.runID === 'string' ? i.runID : 'demo-run',
+    staleSeconds: number(i.staleSeconds) && i.staleSeconds > 0 ? i.staleSeconds : 120,
+    etaValiditySeconds: number(i.etaValiditySeconds) && i.etaValiditySeconds > 0 ? i.etaValiditySeconds : 120
+  };
+}
+function syncSource(o) {
+  const key = JSON.stringify([o.mode, o.baseURL, o.runID]);
+  if (key === sourceKey) return;
+  sourceKey = key;
+  snapshot = null;
+  collection = { state: 'ok', observed_at: null, last_success_at: null, error: null };
+  demoStart = null;
+  demoSeq = 0;
+}
+function validError(e) {
+  return e === null || (object(e) && typeof e.code === 'string' && typeof e.message === 'string');
+}
+function validSnapshot(s, runID) {
+  return object(s) && s.schema_version === '1.0' && s.run_id === runID &&
+    typeof s.attempt_id === 'string' && s.attempt_id.length > 0 &&
+    Number.isSafeInteger(s.seq) && s.seq >= 1 && utc(s.timestamp) && utc(s.started_at) &&
+    STATES.has(s.state) && s.execution === 'sequential' && object(s.metrics) && validError(s.error) &&
+    Array.isArray(s.tasks) && s.tasks.length > 0 && s.tasks.length <= 200 &&
+    new Set(s.tasks.map(t => t && t.id)).size === s.tasks.length &&
+    s.tasks.every(t => object(t) && typeof t.id === 'string' && t.id.length > 0 &&
+      typeof t.title === 'string' && STATES.has(t.state) && object(t.progress) &&
+      number(t.progress.completed) && (t.progress.total === null ||
+        (number(t.progress.total) && t.progress.total > 0 && t.progress.completed <= t.progress.total)) &&
+      typeof t.progress.unit === 'string' && t.progress.unit.length > 0 &&
+      object(t.eta) && (t.eta.remaining_seconds === null || number(t.eta.remaining_seconds)) &&
+      METHODS.has(t.eta.method) && (t.eta.remaining_seconds === null) === (t.eta.method === 'unknown') &&
+      utc(t.eta.updated_at) && object(t.dimensions) && object(t.metrics));
+}
+function validEnvelope(e, runID) {
+  return object(e) && object(e.collection) && ['ok', 'unreachable'].includes(e.collection.state) &&
+    utc(e.collection.observed_at) && (e.collection.last_success_at === null || utc(e.collection.last_success_at)) &&
+    validError(e.collection.error) && (e.data === null || validSnapshot(e.data, runID));
+}
+function makeDemo(o) {
+  const now = iso();
+  if (!demoStart) demoStart = now;
+  const tasks = ['准备数据', '执行计算', '整理结果'].map((title, index) => ({
+    id: `task-${index + 1}`, title,
+    state: ['succeeded', 'running', 'pending'][index],
+    progress: { completed: [50, 17, 0][index], total: 50, unit: 'step' },
+    // Each synthetic heartbeat reconfirms the same fixed remaining budget.
+    eta: { remaining_seconds: [0, 480, 900][index], method: 'reported', updated_at: now },
+    dimensions: { stage: index + 1 }, metrics: {}
+  }));
+  return {
+    schema_version: '1.0', run_id: o.runID, attempt_id: 'demo-static',
+    seq: ++demoSeq, timestamp: now, started_at: demoStart,
+    state: 'running', execution: 'sequential', tasks,
+    metrics: { task_count: 3, synthetic: true }, error: null
+  };
+}
+function originOnly(value) {
+  try {
+    const u = new URL(value);
+    return ['https:', 'http:'].includes(u.protocol) && !u.username && !u.password &&
+      !u.search && !u.hash && u.pathname === '/' && (value === u.origin || value === u.origin + '/');
+  } catch (_) { return false; }
+}
+function interrupt(code) {
+  // Never display backend error bodies, thrown messages, URLs or credentials.
+  collection = { ...collection, state: 'unreachable', observed_at: iso(), error: { code, message: '观测中断' } };
+}
+function canonical(value) {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
+  if (object(value)) return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}`;
+  return JSON.stringify(value);
+}
+function transitionError(previous, next) {
+  if (!previous || next.attempt_id !== previous.attempt_id) return null;
+  if (next.seq === previous.seq && canonical(next) !== canonical(previous)) return 'SEQ_CONFLICT';
+  if (next.seq < previous.seq || Date.parse(next.timestamp) < Date.parse(previous.timestamp)) return 'OUT_OF_ORDER';
+  if (terminal(previous.state) && next.state !== previous.state) return 'STATE_REGRESSION';
+  if (previous.tasks.length !== next.tasks.length || previous.tasks.some((t, i) => t.id !== next.tasks[i].id)) return 'TASK_CONFLICT';
+  for (let i = 0; i < previous.tasks.length; i += 1) {
+    const before = previous.tasks[i], after = next.tasks[i];
+    if (terminal(before.state) && after.state !== before.state) return 'STATE_REGRESSION';
+    if (after.progress.completed < before.progress.completed) return 'PROGRESS_REGRESSION';
+  }
+  return null;
+}
+function serverCollection(value) {
+  // Preserve observation facts, but never echo an upstream error message.
+  return { ...value, error: value.error === null ? null : { code: value.error.code, message: '观测中断' } };
+}
+function collectDemo() {
+  const now = iso();
+  collection = { state: 'ok', observed_at: now, last_success_at: now, error: null };
+}
+async function update(env) {
+  if (busy) return;
+  busy = true;
+  const o = options(env);
+  syncSource(o);
+  const requestKey = sourceKey;
+  try {
+    if (o.mode === 'demo') {
+      snapshot = makeDemo(o);
+      collectDemo();
+      return;
+    }
+    if (!originOnly(o.baseURL) || !o.runID) { interrupt('CONFIG'); return; }
+    const headers = { Accept: 'application/json' };
+    let token = '';
+    try { token = $metrix.secret('token') || ''; } catch (_) { /* Optional secret may be unset. */ }
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const response = await fetch(`${new URL(o.baseURL).origin}/v1/runs/${encodeURIComponent(o.runID)}/snapshot`, {
+      method: 'GET', headers, redirect: 'error', signal: AbortSignal.timeout(8000)
+    });
+    if (requestKey !== sourceKey || !response.ok) {
+      if (response.body) await response.body.cancel();
+      if (requestKey === sourceKey) interrupt('HTTP');
+      return;
+    }
+    const body = await response.json();
+    if (requestKey !== sourceKey) return;
+    if (!validEnvelope(body, o.runID)) { interrupt('INVALID_ENVELOPE'); return; }
+    if (body.data === null) {
+      if (snapshot && body.collection.state === 'ok') { interrupt('EMPTY_SNAPSHOT'); return; }
+      collection = serverCollection(body.collection);
+      return;
+    }
+    const next = body.data;
+    const rejection = transitionError(snapshot, next);
+    if (rejection) { interrupt(rejection); return; }
+    // A disconnected upstream may still return a valid server cache on first load.
+    // Store a complete replacement, never a partial merge or local countdown.
+    snapshot = next;
+    collection = serverCollection(body.collection);
+  } catch (_) {
+    if (requestKey === sourceKey) interrupt('FETCH_OR_PARSE');
+  } finally { busy = false; }
+}
+function ageSeconds(time, now) { return (now - Date.parse(time)) / 1000; }
+function freshETA(t, o, now) {
+  return t.eta.remaining_seconds !== null && t.eta.method !== 'unknown' &&
+    ageSeconds(t.eta.updated_at, now) >= -5 && ageSeconds(t.eta.updated_at, now) <= o.etaValiditySeconds;
+}
+function duration(seconds) {
+  if (seconds === null) return '未知';
+  const n = Math.ceil(seconds);
+  const hours = Math.floor(n / 3600), minutes = Math.floor(n % 3600 / 60), rest = n % 60;
+  return [hours ? `${hours} 小时` : '', minutes ? `${minutes} 分` : '', rest || n === 0 ? `${rest} 秒` : ''].filter(Boolean).join(' ');
+}
+function wholeETA(s, o, now, frozen = false) {
+  if (s.state === 'succeeded') return { seconds: 0, label: '已完成' };
+  if (stopped(s.state) || s.tasks.some(t => stopped(t.state))) return { seconds: null, label: '已停止' };
+  const unfinished = s.tasks.filter(t => t.state !== 'succeeded');
+  if (!unfinished.length) return { seconds: null, label: '未知 · 等待整场完成确认' };
+  if (!unfinished.every(t => frozen ? t.eta.remaining_seconds !== null : freshETA(t, o, now))) return { seconds: null, label: '未知 · 存在未知或过期阶段 ETA' };
+  const sum = unfinished.reduce((n, t) => n + t.eta.remaining_seconds, 0);
+  return Number.isFinite(sum) ? { seconds: sum, label: duration(sum) } : { seconds: null, label: '未知 · 超出数值范围' };
+}
+function nativeTextStyle(props) {
+  // Metrix.Bar 0.1.2 exposes textColor, rather than the newer docs' color alias.
+  const { color, ...rest } = props;
+  return color === undefined ? rest : { ...rest, textColor: color };
+}
+const text = (value, props = {}) => ({ type: 'Text', props: { text: value, wrap: true, ...nativeTextStyle(props) } });
+const column = (children, props = {}) => ({ type: 'Column', props: { gap: 6, ...nativeTextStyle(props) }, children });
+function totalProgress(s) {
+  if (!s || new Set(s.tasks.map(t => t.progress.unit)).size !== 1 ||
+      s.tasks.some(t => t.progress.total === null)) return null;
+  const completed = s.tasks.reduce((sum, t) => sum + t.progress.completed, 0);
+  const total = s.tasks.reduce((sum, t) => sum + t.progress.total, 0);
+  return Number.isFinite(completed) && Number.isFinite(total) && total > 0 ?
+    { completed, total, unit: s.tasks[0].progress.unit, ratio: completed / total } : null;
+}
+function stageRingData(tasks, total) {
+  const data = [];
+  for (const task of tasks) {
+    const p = task.progress;
+    // Each task owns p.total / total of the circle, including its end gap.
+    // The completed/remainder split has no gap inside the task's own arc.
+    const gap = tasks.length > 1 ? Math.min(total * 0.012, p.total * 0.15) : 0;
+    const visible = p.total - gap;
+    const done = visible * (p.completed / p.total);
+    if (done > 0) data.push({ label: task.title, value: done, color: 'accent' });
+    if (visible - done > 0) data.push({ label: task.title, value: visible - done, color: 'border' });
+    if (gap > 0) data.push({ label: '', value: gap, color: 'surface' });
+  }
+  return data;
+}
+const stateLabel = { pending: '未开始', running: '运行中', succeeded: '已完成', failed: '失败', cancelled: '已取消' };
+const row = (children, props = {}) => ({ type: 'Row', props: { gap: 8, ...props }, children });
+export default {
+  async scheduled(env) { await update(env); },
+  render(env) {
+    const o = options(env);
+    syncSource(o);
+    if (o.mode === 'demo' && !snapshot) {
+      snapshot = makeDemo(o);
+      collectDemo();
+    }
+    const now = Date.now();
+    const stale = snapshot && ageSeconds(snapshot.timestamp, now) > o.staleSeconds;
+    const interrupted = collection.state === 'unreachable';
+    const clockAnomaly = snapshot && ageSeconds(snapshot.timestamp, now) < -5;
+    const frozen = interrupted || stale || clockAnomaly;
+    const estimate = snapshot ? wholeETA(snapshot, o, now, frozen) : { seconds: null, label: '未知' };
+    const stoppedRun = snapshot && (stopped(snapshot.state) || snapshot.tasks.some(t => stopped(t.state)));
+    const notice = [interrupted ? '观测中断' : null, stale ? '数据过期' : null,
+      clockAnomaly ? '源时间异常' : null, frozen ? '估计已冻结' : null,
+      stoppedRun ? '已停止' : snapshot && snapshot.error ? '任务错误' : null].filter(Boolean).join(' · ');
+    const progress = totalProgress(snapshot);
+    const percentage = progress ? `${Math.round(progress.ratio * 100)}%` : '未知';
+    const active = snapshot ? snapshot.tasks.findIndex(t => t.state === 'running') : -1;
+    const phase = !snapshot ? '等待快照' : active >= 0 ? `当前阶段 ${active + 1}/${snapshot.tasks.length}` :
+      `已完成阶段 ${snapshot.tasks.filter(t => t.state === 'succeeded').length}/${snapshot.tasks.length}`;
+    const ring = progress ? {
+      type: 'Box', props: { width: 170, height: 170 }, children: [
+        { type: 'Chart', props: { type: 'pie', height: 170, innerRadius: 0.78,
+          data: stageRingData(snapshot.tasks, progress.total), padAngle: 0,
+          legend: false, pieLabels: false, hover: false, appear: false } },
+        text(percentage, { absolute: true, top: 63, left: 0, width: 170, height: 44,
+          textAlign: 'center', bold: true, fontSize: 32, color: 'text' })
+      ]
+    } : column([text('总进度未知', { bold: true, fontSize: 22 }),
+      text(phase, { color: 'textMuted', fontSize: 12 })], { height: 170, width: 170, justify: 'center' });
+    const body = snapshot ? snapshot.tasks.map(t => {
+      const p = t.progress;
+      const eta = t.state === 'succeeded' ? '已完成' : stoppedRun ? '已停止' :
+        frozen ? '估计冻结' : freshETA(t, o, now) ? duration(t.eta.remaining_seconds) : 'ETA 未知';
+      return column([
+        row([text(t.title, { fontSize: 13, bold: true, grow: 1 }),
+          text(t.state === 'succeeded' || stopped(t.state) ? stateLabel[t.state] : `${stateLabel[t.state]} · ${eta}`, { fontSize: 11, color: stopped(t.state) ? 'danger' : 'textMuted' })]),
+        row([
+          { type: 'Progress', props: { value: p.total === null ? -1 : p.completed / p.total, grow: 1, height: 4 } },
+          text(`${p.completed}/${p.total === null ? '?' : p.total} ${p.unit === 'step' ? '步' : p.unit}`, { fontSize: 11, color: 'textMuted' })
+        ])
+      ], { gap: 5 });
+    }) : [text(interrupted ? '快照不可用' : '等待首次快照', { color: 'textMuted', fontSize: 13 })];
+    const etaLabel = estimate.seconds === null ? (stoppedRun ? '已停止' : '未知') :
+      estimate.seconds === 0 ? '已完成' : estimate.seconds % 60 === 0 ? `${estimate.seconds / 60} 分钟` : duration(estimate.seconds);
+    return {
+      tray: { title: snapshot ? `ETA ${frozen ? '已冻结 · ' : ''}${etaLabel}` : 'ETA 等待快照',
+        ...(frozen || stoppedRun ? { error: notice } : {}) },
+      panel: column([
+        row([text('实验进度', { bold: true, fontSize: 17, grow: 1 }),
+          text(o.mode === 'demo' ? '示例' : 'API', { fontSize: 10, color: 'textMuted' })]),
+        row([ring, column([
+          text(frozen ? 'ETA · 已冻结' : 'ETA', { fontSize: 11, color: 'textMuted' }),
+          text(etaLabel, { fontSize: 24, bold: true, color: stoppedRun || interrupted ? 'danger' : frozen ? 'warning' : 'text' }),
+          text(progress ? `${progress.completed}/${progress.total} ${progress.unit === 'step' ? '步' : progress.unit}` : '工作量总量未知', { fontSize: 12, color: 'textMuted' }),
+          text(phase, { fontSize: 12, color: 'textMuted' })
+        ], { gap: 7, grow: 1 })]),
+        ...(notice ? [text(notice, { fontSize: 11, color: stoppedRun || interrupted ? 'danger' : 'warning' })] : []),
+        { type: 'Scroll', props: { grow: 1, minHeight: 0, fillWidth: true }, children: [column(body, { gap: 16, fillWidth: true })] },
+        row([text('30 秒刷新', { fontSize: 11, color: 'textMuted', grow: 1 }),
+          { type: 'Button', props: { text: '刷新', onClick: async () => { await update(env); } } }])
+      ], { preferredWidth: 360, preferredHeight: 470, fill: true, minHeight: 0, padding: 16, gap: 12 })
+    };
+  }
+};
+  ]]></script>
+</bar>
