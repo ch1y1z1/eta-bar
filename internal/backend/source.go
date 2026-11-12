@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"syscall"
 	"time"
 )
@@ -42,7 +43,22 @@ func (b *limitedOutput) Write(p []byte) (int, error) {
 }
 func (s *Server) readSource(ctx context.Context, source Source) ([]byte, error) {
 	if source.Mode == "local" {
-		f, err := os.OpenFile(source.LogPath, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+		var f *os.File
+		var err error
+		if source.localRoot != "" {
+			root, openErr := os.OpenRoot(source.localRoot)
+			if openErr != nil {
+				return nil, openErr
+			}
+			defer root.Close()
+			rel, relErr := filepath.Rel(source.localRoot, source.LogPath)
+			if relErr != nil {
+				return nil, relErr
+			}
+			f, err = root.OpenFile(rel, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+		} else {
+			f, err = os.OpenFile(source.LogPath, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+		}
 		if err != nil {
 			return nil, err
 		}

@@ -175,7 +175,7 @@ func validateSnapshot(b []byte, runID string) (validated, error) {
 	if !ok {
 		return out, invalid
 	}
-	if m["schema_version"] != "1.0" || m["run_id"] != runID || !idPattern.MatchString(text(m["attempt_id"])) || !utc(m["timestamp"]) || !utc(m["started_at"]) || !oneOf(m["state"], "pending running succeeded failed cancelled") || m["execution"] != "sequential" || !scalars(m["metrics"]) || !validError(m["error"]) {
+	if m["schema_version"] != "1.0" || !idPattern.MatchString(text(m["run_id"])) || (runID != "" && m["run_id"] != runID) || !idPattern.MatchString(text(m["attempt_id"])) || !utc(m["timestamp"]) || !utc(m["started_at"]) || !oneOf(m["state"], "pending running succeeded failed cancelled") || m["execution"] != "sequential" || !scalars(m["metrics"]) || !validError(m["error"]) {
 		return out, invalid
 	}
 	if m["state"] == "failed" && m["error"] == nil {

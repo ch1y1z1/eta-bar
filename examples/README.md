@@ -2,13 +2,21 @@
 
 本目录仅含合成日志和通用配置占位值。`config.example.json` 使用 local source，run ID 为 `demo-run`，绝对路径占位为 `/data/experiments/demo/monitor.jsonl`；复制后替换成自己的绝对路径，或按[根目录 quickstart](../README.md)用 Python `Path.resolve()` 生成本地 `config.json`。运行配置和实际日志不提交。
 
-Config JSON 仅接受 `hosts` 和 `runs`；run 为 `id`、`title`、`source` 和可选对象 `manifest`。source 为 `mode`、绝对 `log_path` 和 SSH 可选字段 `host`。监听、缓存通过 `-listen`/`ETA_LISTEN`、`-data-dir`/`ETA_DATA_DIR` 设置，配置文件通过 `-config`/`ETA_CONFIG` 设置；默认分别为 `127.0.0.1:8080`、`data`、`config.json`。token 仅通过 `ETA_API_TOKEN` 设置。未知配置字段会被 `DisallowUnknownFields` 拒绝。
+Config JSON 接受 `hosts`、`runs` 和可选 `local_allowed_roots`（默认空数组，禁止 `/`）；run 为 `id`、`title`、`source` 和可选对象 `manifest`。source 为 `mode`、绝对 `log_path` 和 SSH 可选字段 `host`。监听、缓存通过 `-listen`/`ETA_LISTEN`、`-data-dir`/`ETA_DATA_DIR` 设置，配置文件通过 `-config`/`ETA_CONFIG` 设置；默认分别为 `127.0.0.1:8080`、`data`、`config.json`。token 仅通过 `ETA_API_TOKEN` 设置。未知配置字段会被 `DisallowUnknownFields` 拒绝。
+
+路径模式可使用最小配置：
+
+```json
+{"hosts": {}, "runs": [], "local_allowed_roots": ["/logs"]}
+```
+
+`/logs` 是容器内的只读挂载目录。bar 设置 `sourceHost=local`、`logPath=/logs/monitor.jsonl` 并设置 token；在同一允许目录内更换日志只改 logPath，run_id 自动发现。SSH 模式选择 `sourceHost=demo-host` 和该主机上的路径，复用下方 profile，无需添加 runs。local 默认不允许读取任意文件系统；旧 runs 中显式配置的单个 local 文件保持原有行为。
 
 ## SSH profile 示例
 
 `config.ssh.example.json` 中 `source.host=demo-host` 指向 `hosts` 的 key；该 profile 的 `alias=experiment-host` 才是传给 OpenSSH 的 Host 别名，`allowed_root=/data/experiments` 为远端允许读取的根目录。路径仍为 `/data/experiments/demo/monitor.jsonl`。使用前自行配置专用 SSH config、key 和 known_hosts；真实值留在本地，不写入示例。
 
-采集使用非交互 SSH、严格主机校验、5 秒连接超时及 8 秒采集上下文超时，远端用 `readlink -f` 校验路径位于 allowed_root 下再执行有界 tail。配置示例本身不发起连接；本轮验证只使用 local source。Docker 日志路径应为容器内 `/logs/monitor.jsonl`，生成及挂载步骤见根目录 README。
+采集使用非交互 SSH、严格主机校验、5 秒连接超时及 8 秒采集上下文超时，远端用 `readlink -f` 校验路径位于 allowed_root 下再执行有界 tail。配置示例本身不发起连接；自动化测试使用本地文件和模拟 SSH 执行器，不连接真实实验主机。Docker 日志路径应为容器内 `/logs/monitor.jsonl`，生成及挂载步骤见根目录 README。
 
 ## 合成日志
 

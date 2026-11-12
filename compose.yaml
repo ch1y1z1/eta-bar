@@ -2,7 +2,7 @@ services:
   backend:
     build: .
     ports:
-      - "127.0.0.1:8080:8080"
+      - "${ETA_PUBLISH_ADDRESS:-0.0.0.0}:8080:8080"
     environment:
       ETA_API_TOKEN: "${ETA_API_TOKEN:?Set ETA_API_TOKEN to a random bearer token}"
       ETA_LISTEN: "0.0.0.0:8080"

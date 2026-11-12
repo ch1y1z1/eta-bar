@@ -59,6 +59,7 @@ Go module 为 `eta-bar`，要求 Go 1.25；启动命令为 `go run ./cmd/eta-ser
 
 ```json
 {
+  "local_allowed_roots": ["/data/experiments"],
   "hosts": {
     "demo-host": {"alias": "experiment-host", "allowed_root": "/data/experiments"}
   },
@@ -72,15 +73,20 @@ Go module 为 `eta-bar`，要求 Go 1.25；启动命令为 `go run ./cmd/eta-ser
 
 `source.mode` 仅为 `local` 或 `ssh`，`log_path` 必须是绝对路径。SSH 另设 `source.host` 为 profile key（例中 `demo-host`），通过其 alias 连接，并将真实解析后的远端路径约束在 allowed_root 内。run 可附 `manifest` JSON 对象。未知字段由 `LoadConfig` 的 `DisallowUnknownFields` 拒绝，包括 `listen`、`data_dir`、`poll_interval_seconds`、`sources`。
 
-配置文件、监听和缓存目录通过 `-config`、`-listen`、`-data-dir` flag 指定；默认从 `ETA_CONFIG`、`ETA_LISTEN`、`ETA_DATA_DIR` 读取，未设置时分别为 `config.json`、`127.0.0.1:8080`、`data`。显式 flag 优先。`ETA_API_TOKEN` 设置 Bearer token。轮询固定 15 秒，启动时立即采集，API 请求只读缓存，不触发 SSH 或实验执行。
+配置文件、监听和缓存目录通过 `-config`、`-listen`、`-data-dir` flag 指定；默认从 `ETA_CONFIG`、`ETA_LISTEN`、`ETA_DATA_DIR` 读取，未设置时分别为 `config.json`、`127.0.0.1:8080`、`data`。显式 flag 优先。`ETA_API_TOKEN` 设置 Bearer token。已配置 runs 的轮询固定 15 秒，启动时立即采集；旧 run API 只读缓存。路径 API 按请求读取文件或 SSH，不执行实验。
 
 | GET 路由 | 响应 |
 | --- | --- |
 | `/healthz` | `{"status":"ok"}`，无需鉴权 |
+| `/v1/snapshot?host=local&path=%2Flogs%2Fmonitor.jsonl` | 按路径现场采集，返回同样的 envelope，始终要求 Bearer token |
 | `/v1/runs` | `{"runs":[{"id":"demo-run","title":"Synthetic demo"}]}` |
 | `/v1/runs/{id}/snapshot` | `data` 与 `collection` envelope，见[前端说明](../frontend/README.md) |
 | `/v1/runs/{id}/manifest` | 配置中的 manifest 对象；未配置时返回默认对象 |
 | `/v1/runs/{id}/history` | 不支持；鉴权通过后返回 404 |
+
+路径 API 必须配置 `ETA_API_TOKEN`，无 token 即使 loopback 也返回 401。查询必须恰好包含一个 `host` 和一个 `path`；不接受额外字段。`host=local` 使用 `local_allowed_roots`（默认无授权），其他值仅匹配预设 hosts key；`local` 是保留名。绝对 path 最长 4096 字节，拒绝 `..` 路径段、NUL、CR/LF 和根外路径，不能直接传入 hostname、SSH 选项或命令。非法来源统一返回 400 `invalid_source`，不回显路径。根目录配置必须为非 `/` 的绝对路径。local 使用 Go `os.Root` 阻止符号链接逃逸，SSH 固定命令解析路径后检查允许根，远端目录变更与权限由部署者管理。
+
+路径 API 返回与旧 snapshot 相同的 envelope，读取失败仍返回 200、`unreachable` 和该源最后有效快照。首条完整且通过全部验证的快照决定 run_id；同一缓存源的 run_id 不允许变化，新执行应更换 attempt。host 与规范化 path 共同作为缓存标识；缓存最多 64 源，按 LRU 淘汰，每源最多 128 attempt。请求串行执行，不创建 watcher 或磁盘 checkpoint；重启或淘汰后生命周期验证从当前窗口重新开始。旧 runs 的 15 秒后台采集和磁盘 checkpoint 不变，显式配置的 local 单文件也不受新的路径 API 根授权影响。
 
 设置 token 后除 healthz 外需 `Authorization: Bearer …`，未通过时返回 401。未知 run 或路由返回 404，非 GET 返回 405。采集层错误与实验错误分别位于 `collection.error` 和 `data.error`。源端 SSH/文件错误使用安全固定信息，不返回 stderr 或源路径；通过验证的快照业务字段与 manifest 会经 API 返回，后端不对业务文本自动脱敏。实验记录器不得把凭据或不应展示的信息写入这些字段。
 
@@ -101,10 +107,10 @@ manifest 不用于推算未知预算或 total。原生 bar 负责校验 envelope
 - 预期心跳周期，ETA 表示当前阶段还是整场、估计来源及是否存在未知的后续阶段。
 - 一条只读查看命令，和已确认首条完整有效快照产生的说明；不能把当前对象序号误写成已完成数。
 
-用户用该日志路径登记后端数据源，再在通用 bar 中配置对应 run_id。真实路径和连接细节只在获授权的交接渠道提供，不写入公开仓库；不得附带任何私钥或访问令牌。Agent 无需为了监控而持续占用长任务对话。
+用户在 bar 设置 sourceHost 和 logPath，后端自动从有效快照识别 run_id；新目录需由部署者预先挂载并授权，允许根内切换文件无需登记 run。logPath 留空可继续使用旧 runID。真实路径和连接细节只在获授权的交接渠道提供，不写入公开仓库；不得附带任何私钥或访问令牌。Agent 无需为了监控而持续占用长任务对话。
 
 ## 安全与分发
 
-SSH 连接信息、私钥、API token 由部署环境管理，不放源码、manifest、样例、错误正文或 Git 仓库；启用 known_hosts 校验。无 token 服务只允许 loopback；非 loopback 监听必须设置 `ETA_API_TOKEN`。Compose 强制要求 token，主机端口绑定 `127.0.0.1:8080`，容器内监听 `0.0.0.0:8080`。运行镜像为 Alpine 3.22，包含 OpenSSH client，使用 UID 10001。配置和日志只读挂载，缓存使用 `/data` volume；本轮仅做本地联调。
+SSH 连接信息、私钥、API token 由部署环境管理，不放源码、manifest、样例、错误正文或 Git 仓库；启用 known_hosts 校验。无 token 服务只允许 loopback；非 loopback 监听必须设置 `ETA_API_TOKEN`。Compose 强制要求 token，主机端口默认绑定 `0.0.0.0:8080`，可通过 `ETA_PUBLISH_ADDRESS` 覆盖；容器内监听 `0.0.0.0:8080`。Mac 直接连接可路由的后端 origin，无需 SSH 隧道。运行镜像为 Alpine 3.22，包含 OpenSSH client，使用 UID 10001。配置和日志只读挂载，缓存使用 `/data` volume；部署者配置网络路由、防火墙及只读日志挂载。
 
 示例 `experiment-host` 为 SSH Host 别名，`compute.example.org` 为通用域名，`/data/experiments/demo/monitor.jsonl` 为通用占位路径。真实部署配置与日志均留在版本控制之外。MIT 只覆盖本仓库原创代码；设计参考只链接公开 [Metrix.Bar 文档](https://metrix.bar/docs/bar-format.md) 和 [组件文档](https://metrix.bar/docs/components.md)，不复制官方实现或 skill。

@@ -1,14 +1,16 @@
-<bar protocol-version="0" id="eta-sequential-prototype" title="实验进度" version="0.2.1" description="静态合成进度示例与可选快照 API" refresh="30s">
+<bar protocol-version="0" id="eta-sequential-prototype" title="实验进度" version="0.2.2" description="按日志路径连接后端的实验进度与 ETA" refresh="30s">
   <permissions>
-    <network origin="{{ inputs.baseURL }}" />
+    <network origin="{{ inputs.baseURL }}" allow-http="true" />
   </permissions>
   <inputs>
     <input name="mode" type="select" label="数据模式" default="demo">
       <option value="demo" label="Demo · 离线假数据" />
       <option value="api" label="API · Go 后端" />
     </input>
-    <input name="baseURL" type="string" label="API origin" default="" help="仅 origin，如 https://example.com 或 http://localhost:8080；禁止路径、查询、片段及凭据。Demo 无网络。" />
-    <input name="runID" type="string" label="Run ID" default="demo-run" />
+    <input name="baseURL" type="string" label="API origin" default="http://localhost:8080" help="仅 origin，如 https://example.com 或 http://localhost:8080；禁止路径、查询、片段及凭据。Demo 无网络。" />
+    <input name="sourceHost" type="string" label="源主机配置名" default="local" help="local 为后端挂载文件；SSH 仅允许后端预设的 host profile 名。" />
+    <input name="logPath" type="string" label="monitor.jsonl 路径" default="" help="后端主机或预设 SSH 主机上的绝对路径。填写后自动识别 run_id；留空使用 Run ID。" />
+    <input name="runID" type="string" label="Run ID（路径留空时）" default="demo-run" />
     <input name="staleSeconds" type="number" label="源快照过期秒数" default="120" />
     <input name="etaValiditySeconds" type="number" label="ETA 独立有效秒数" default="120" />
     <input name="token" type="secret" label="可选 Bearer token" help="仅用于请求 Authorization；不写入 URL、界面或日志。" />
@@ -36,12 +38,14 @@ function options(env) {
     mode: i.mode === 'api' ? 'api' : 'demo',
     baseURL: typeof i.baseURL === 'string' ? i.baseURL : '',
     runID: typeof i.runID === 'string' ? i.runID : 'demo-run',
+    sourceHost: typeof i.sourceHost === 'string' ? i.sourceHost : 'local',
+    logPath: typeof i.logPath === 'string' ? i.logPath : '',
     staleSeconds: number(i.staleSeconds) && i.staleSeconds > 0 ? i.staleSeconds : 120,
     etaValiditySeconds: number(i.etaValiditySeconds) && i.etaValiditySeconds > 0 ? i.etaValiditySeconds : 120
   };
 }
 function syncSource(o) {
-  const key = JSON.stringify([o.mode, o.baseURL, o.runID]);
+  const key = JSON.stringify([o.mode, o.baseURL, o.runID, o.sourceHost, o.logPath]);
   if (key === sourceKey) return;
   sourceKey = key;
   snapshot = null;
@@ -53,7 +57,8 @@ function validError(e) {
   return e === null || (object(e) && typeof e.code === 'string' && typeof e.message === 'string');
 }
 function validSnapshot(s, runID) {
-  return object(s) && s.schema_version === '1.0' && s.run_id === runID &&
+  return object(s) && s.schema_version === '1.0' && typeof s.run_id === 'string' &&
+    /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(s.run_id) && (runID === null || s.run_id === runID) &&
     typeof s.attempt_id === 'string' && s.attempt_id.length > 0 &&
     Number.isSafeInteger(s.seq) && s.seq >= 1 && utc(s.timestamp) && utc(s.started_at) &&
     STATES.has(s.state) && s.execution === 'sequential' && object(s.metrics) && validError(s.error) &&
@@ -108,7 +113,9 @@ function canonical(value) {
   return JSON.stringify(value);
 }
 function transitionError(previous, next) {
-  if (!previous || next.attempt_id !== previous.attempt_id) return null;
+  if (!previous) return null;
+  if (next.run_id !== previous.run_id) return 'RUN_CONFLICT';
+  if (next.attempt_id !== previous.attempt_id) return null;
   if (next.seq === previous.seq && canonical(next) !== canonical(previous)) return 'SEQ_CONFLICT';
   if (next.seq < previous.seq || Date.parse(next.timestamp) < Date.parse(previous.timestamp)) return 'OUT_OF_ORDER';
   if (terminal(previous.state) && next.state !== previous.state) return 'STATE_REGRESSION';
@@ -140,12 +147,14 @@ async function update(env) {
       collectDemo();
       return;
     }
-    if (!originOnly(o.baseURL) || !o.runID) { interrupt('CONFIG'); return; }
+    if (!originOnly(o.baseURL) || (o.logPath ? !o.sourceHost : !o.runID)) { interrupt('CONFIG'); return; }
     const headers = { Accept: 'application/json' };
     let token = '';
     try { token = $metrix.secret('token') || ''; } catch (_) { /* Optional secret may be unset. */ }
     if (token) headers.Authorization = `Bearer ${token}`;
-    const response = await fetch(`${new URL(o.baseURL).origin}/v1/runs/${encodeURIComponent(o.runID)}/snapshot`, {
+    const route = o.logPath ? `/v1/snapshot?host=${encodeURIComponent(o.sourceHost)}&path=${encodeURIComponent(o.logPath)}` :
+      `/v1/runs/${encodeURIComponent(o.runID)}/snapshot`;
+    const response = await fetch(`${new URL(o.baseURL).origin}${route}`, {
       method: 'GET', headers, redirect: 'error', signal: AbortSignal.timeout(8000)
     });
     if (requestKey !== sourceKey || !response.ok) {
@@ -155,7 +164,7 @@ async function update(env) {
     }
     const body = await response.json();
     if (requestKey !== sourceKey) return;
-    if (!validEnvelope(body, o.runID)) { interrupt('INVALID_ENVELOPE'); return; }
+    if (!validEnvelope(body, o.logPath ? null : o.runID)) { interrupt('INVALID_ENVELOPE'); return; }
     if (body.data === null) {
       if (snapshot && body.collection.state === 'ok') { interrupt('EMPTY_SNAPSHOT'); return; }
       collection = serverCollection(body.collection);

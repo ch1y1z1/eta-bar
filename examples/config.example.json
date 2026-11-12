@@ -1,5 +1,6 @@
 {
   "hosts": {},
+  "local_allowed_roots": ["/data/experiments"],
   "runs": [
     {
       "id": "demo-run",

@@ -1,4 +1,5 @@
 {
+  "local_allowed_roots": [],
   "hosts": {
     "demo-host": {
       "alias": "experiment-host",

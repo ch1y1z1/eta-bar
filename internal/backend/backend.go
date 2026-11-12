@@ -30,9 +30,10 @@ type HostProfile struct {
 	AllowedRoot string `json:"allowed_root"`
 }
 type Source struct {
-	Mode    string `json:"mode"`
-	Host    string `json:"host,omitempty"`
-	LogPath string `json:"log_path"`
+	Mode      string `json:"mode"`
+	Host      string `json:"host,omitempty"`
+	LogPath   string `json:"log_path"`
+	localRoot string
 }
 type Run struct {
 	ID       string          `json:"id"`
@@ -41,8 +42,9 @@ type Run struct {
 	Manifest json.RawMessage `json:"manifest,omitempty"`
 }
 type Config struct {
-	Hosts map[string]HostProfile `json:"hosts"`
-	Runs  []Run                  `json:"runs"`
+	Hosts             map[string]HostProfile `json:"hosts"`
+	Runs              []Run                  `json:"runs"`
+	LocalAllowedRoots []string               `json:"local_allowed_roots,omitempty"`
 }
 type SafeError struct {
 	Code    string `json:"code"`
@@ -69,16 +71,20 @@ type checkpoint struct {
 	Attempts map[string]Cursor `json:"attempts"`
 }
 type runState struct {
-	mu    sync.RWMutex
-	run   Run
-	saved checkpoint
+	mu       sync.RWMutex
+	run      Run
+	saved    checkpoint
+	onDemand bool
 }
 type Server struct {
-	config  Config
-	dataDir string
-	token   [32]byte
-	auth    bool
-	runs    map[string]*runState
+	config    Config
+	dataDir   string
+	token     [32]byte
+	auth      bool
+	runs      map[string]*runState
+	pathsMu   sync.Mutex
+	paths     map[Source]*pathEntry
+	pathClock uint64
 }
 
 func LoadConfig(path string) (Config, error) {
@@ -113,8 +119,13 @@ func ValidateListen(address, token string) error {
 
 func New(c Config, dataDir, token string) (*Server, error) {
 	s := &Server{config: c, dataDir: dataDir, auth: token != "", token: sha256.Sum256([]byte(token)), runs: map[string]*runState{}}
-	for _, h := range c.Hosts {
-		if !aliasPattern.MatchString(h.Alias) || !strings.HasPrefix(h.AllowedRoot, "/") || filepath.Clean(h.AllowedRoot) == "/" || strings.ContainsAny(h.AllowedRoot, "\x00\r\n") {
+	for _, root := range c.LocalAllowedRoots {
+		if !safeAbsolutePath(root) || filepath.Clean(root) == "/" {
+			return nil, errors.New("invalid local allowed root")
+		}
+	}
+	for name, h := range c.Hosts {
+		if name == "local" || !idPattern.MatchString(name) || !aliasPattern.MatchString(h.Alias) || !strings.HasPrefix(h.AllowedRoot, "/") || filepath.Clean(h.AllowedRoot) == "/" || strings.ContainsAny(h.AllowedRoot, "\x00\r\n") {
 			return nil, errors.New("invalid host profile")
 		}
 	}
@@ -145,7 +156,8 @@ func New(c Config, dataDir, token string) (*Server, error) {
 }
 func now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 
-// Start launches one independent collector per run. Requests never trigger SSH or file I/O.
+// Start launches one independent collector per configured run. Legacy run routes
+// read its cache; the separate path route collects on demand.
 // A bounded tail is re-read every interval; history before that window is not collected.
 func (s *Server) Start(ctx context.Context) {
 	for _, st := range s.runs {
@@ -219,6 +231,9 @@ func (s *Server) poll(ctx context.Context, st *runState) {
 			c.LastSuccessAt = &t
 		}
 	}
+	if st.onDemand {
+		return
+	}
 	if err := s.persist(st); err != nil {
 		c.LastSuccessAt = previousSuccess
 		c.State = "unreachable"
@@ -231,6 +246,9 @@ func (s *Server) accept(st *runState, line []byte, identities map[string]string)
 	v, err := validateSnapshot(line, st.run.ID)
 	if err != nil {
 		return collectionError("data_invalid", "Invalid complete snapshot")
+	}
+	if st.onDemand && st.run.ID == "" {
+		st.run.ID = text(v.Fields["run_id"])
 	}
 	hash := fmt.Sprintf("%x", sha256.Sum256(v.Canonical))
 	key := fmt.Sprintf("%s/%d", v.Attempt, v.Seq)
@@ -360,6 +378,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 401, "unauthorized")
 			return
 		}
+	}
+	if r.URL.Path == "/v1/snapshot" {
+		if !s.auth {
+			writeError(w, 401, "unauthorized")
+			return
+		}
+		s.pathSnapshot(w, r)
+		return
 	}
 	if r.URL.Path == "/v1/runs" {
 		runs := make([]map[string]string, 0, len(s.config.Runs))
