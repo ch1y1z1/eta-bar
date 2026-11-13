@@ -1,4 +1,4 @@
-<bar protocol-version="0" id="eta-sequential-prototype" title="实验进度" version="0.2.2" description="按日志路径连接后端的实验进度与 ETA" refresh="30s">
+<bar protocol-version="0" id="eta-sequential-prototype" title="实验进度" version="0.3.0" description="按日志路径连接后端的实验进度与 ETA" refresh="30s">
   <permissions>
     <network origin="{{ inputs.baseURL }}" allow-http="true" />
   </permissions>
@@ -16,7 +16,7 @@
     <input name="token" type="secret" label="可选 Bearer token" help="仅用于请求 Authorization；不写入 URL、界面或日志。" />
   </inputs>
   <docs><![CDATA[默认 demo 为静态合成数据：67/150 步，剩余 23 分钟。每 30 秒或点击唯一刷新按钮更新心跳，不推进工作量。API 输入与校验见 frontend/README.md；接口对接需与 Go 后端版本匹配。]]></docs>
-  <script><![CDATA[
+  <script apis="localStorage"><![CDATA[
 const STATES = new Set(['pending', 'running', 'succeeded', 'failed', 'cancelled']);
 const METHODS = new Set(['reported', 'rate', 'historical', 'manual', 'unknown']);
 const stopped = state => state === 'failed' || state === 'cancelled';
@@ -29,6 +29,7 @@ let snapshot = null;
 let collection = { state: 'ok', observed_at: null, last_success_at: null, error: null };
 let sourceKey = null;
 let busy = false;
+let generation = 0;
 let demoStart = null;
 let demoSeq = 0;
 
@@ -48,6 +49,8 @@ function syncSource(o) {
   const key = JSON.stringify([o.mode, o.baseURL, o.runID, o.sourceHost, o.logPath]);
   if (key === sourceKey) return;
   sourceKey = key;
+  generation += 1;
+  busy = false;
   snapshot = null;
   collection = { state: 'ok', observed_at: null, last_success_at: null, error: null };
   demoStart = null;
@@ -136,11 +139,11 @@ function collectDemo() {
   collection = { state: 'ok', observed_at: now, last_success_at: now, error: null };
 }
 async function update(env) {
-  if (busy) return;
-  busy = true;
   const o = options(env);
   syncSource(o);
-  const requestKey = sourceKey;
+  if (busy) return;
+  busy = true;
+  const requestGeneration = generation;
   try {
     if (o.mode === 'demo') {
       snapshot = makeDemo(o);
@@ -157,13 +160,13 @@ async function update(env) {
     const response = await fetch(`${new URL(o.baseURL).origin}${route}`, {
       method: 'GET', headers, redirect: 'error', signal: AbortSignal.timeout(8000)
     });
-    if (requestKey !== sourceKey || !response.ok) {
+    if (requestGeneration !== generation || !response.ok) {
       if (response.body) await response.body.cancel();
-      if (requestKey === sourceKey) interrupt('HTTP');
+      if (requestGeneration === generation) interrupt('HTTP');
       return;
     }
     const body = await response.json();
-    if (requestKey !== sourceKey) return;
+    if (requestGeneration !== generation) return;
     if (!validEnvelope(body, o.logPath ? null : o.runID)) { interrupt('INVALID_ENVELOPE'); return; }
     if (body.data === null) {
       if (snapshot && body.collection.state === 'ok') { interrupt('EMPTY_SNAPSHOT'); return; }
@@ -178,8 +181,13 @@ async function update(env) {
     snapshot = next;
     collection = serverCollection(body.collection);
   } catch (_) {
-    if (requestKey === sourceKey) interrupt('FETCH_OR_PARSE');
-  } finally { busy = false; }
+    if (requestGeneration === generation) interrupt('FETCH_OR_PARSE');
+  } finally {
+    if (requestGeneration === generation) {
+      observeHistory(o, Date.now());
+      busy = false;
+    }
+  }
 }
 function ageSeconds(time, now) { return (now - Date.parse(time)) / 1000; }
 function freshETA(t, o, now) {
@@ -200,6 +208,149 @@ function wholeETA(s, o, now, frozen = false) {
   if (!unfinished.every(t => frozen ? t.eta.remaining_seconds !== null : freshETA(t, o, now))) return { seconds: null, label: '未知 · 存在未知或过期阶段 ETA' };
   const sum = unfinished.reduce((n, t) => n + t.eta.remaining_seconds, 0);
   return Number.isFinite(sum) ? { seconds: sum, label: duration(sum) } : { seconds: null, label: '未知 · 超出数值范围' };
+}
+// Dashboard-local storage contains only source identities and ETA observations, never secrets.
+const HISTORY_KEY = 'eta-history-v1';
+const RETENTION_MS = 24 * 60 * 60 * 1000;
+const GAP_MS = 120000;
+const MAX_SOURCES = 8, MAX_RUNS = 8, MAX_POINTS = 720;
+let history = { version: 1, sources: [] };
+let storageNotice = '';
+function cleanHistory(value, now) {
+  const result = { version: 1, sources: [] };
+  if (!object(value) || value.version !== 1 || !Array.isArray(value.sources)) return result;
+  const seenSources = new Set();
+  for (const source of value.sources) {
+    if (!object(source) || typeof source.key !== 'string' || source.key.length > 8192 ||
+        seenSources.has(source.key) || !Array.isArray(source.runs)) continue;
+    seenSources.add(source.key);
+    const runs = [], seenRuns = new Set();
+    for (const run of source.runs) {
+      if (!object(run) || typeof run.id !== 'string' || run.id.length > 8192 ||
+          seenRuns.has(run.id) || !Array.isArray(run.points)) continue;
+      seenRuns.add(run.id);
+      const points = [];
+      for (const point of run.points) {
+        if (!object(point) || !number(point.t) || point.t < now - RETENTION_MS || point.t > now + 5000 ||
+            !number(point.seconds) || typeof point.estimate !== 'string' || point.estimate.length > 65536 ||
+            (points.length && point.t <= points[points.length - 1].t)) continue;
+        points.push({ t: point.t, seconds: point.seconds, estimate: point.estimate,
+          gap: point.gap === true, terminal: point.terminal === true });
+      }
+      if (!points.length) continue;
+      const last = points[points.length - 1];
+      runs.push({ id: run.id, points: points.slice(-MAX_POINTS),
+        lastObserved: number(run.lastObserved) ? Math.min(now, run.lastObserved) : last.t,
+        gap: run.gap === true });
+    }
+    runs.sort((a, b) => b.lastObserved - a.lastObserved);
+    if (runs.length) result.sources.push({ key: source.key, runs: runs.slice(0, MAX_RUNS) });
+  }
+  result.sources.sort((a, b) => b.runs[0].lastObserved - a.runs[0].lastObserved);
+  result.sources = result.sources.slice(0, MAX_SOURCES);
+  // Bound serialized storage as well as counts, including large task fingerprints.
+  while (JSON.stringify(result).length > 1000000) {
+    const oldestSource = result.sources[result.sources.length - 1];
+    const oldestRun = oldestSource.runs[oldestSource.runs.length - 1];
+    if (oldestSource.runs.length > 1 || result.sources.length > 1) oldestSource.runs.pop();
+    else oldestRun.points = oldestRun.points.slice(Math.ceil(oldestRun.points.length / 2));
+    if (!oldestRun.points.length && oldestSource.runs.includes(oldestRun)) oldestSource.runs.pop();
+    if (!oldestSource.runs.length) result.sources.pop();
+  }
+  return result;
+}
+function loadHistory() {
+  try {
+    const raw = localStorage.getItem(HISTORY_KEY);
+    if (raw && raw.length > 4000000) throw new Error('oversize');
+    const parsed = raw ? JSON.parse(raw) : { version: 1, sources: [] };
+    history = cleanHistory(parsed, Date.now());
+    if (raw && JSON.stringify(history) !== JSON.stringify(parsed)) storageNotice = '本地历史已清理';
+  } catch (_) { storageNotice = '本地历史不可读 · 仅本次会话'; }
+}
+function saveHistory(now) {
+  history = cleanHistory(history, now);
+  try {
+    const raw = JSON.stringify(history);
+    if (raw.length > 4000000) throw new Error('oversize');
+    localStorage.setItem(HISTORY_KEY, raw);
+    storageNotice = '';
+  } catch (_) { storageNotice = '本地历史未保存 · 仅本次会话'; }
+}
+loadHistory();
+function historyRun(create = false) {
+  if (!snapshot) return null;
+  let source = history.sources.find(s => s.key === sourceKey);
+  if (!source && create) { source = { key: sourceKey, runs: [] }; history.sources.push(source); }
+  if (!source) return null;
+  const id = JSON.stringify([snapshot.run_id, snapshot.attempt_id]);
+  let run = source.runs.find(r => r.id === id);
+  if (!run && create) {
+    run = { id, points: [], lastObserved: 0, gap: false };
+    source.runs.push(run);
+  }
+  return run || null;
+}
+function historyValid(o, now) {
+  return snapshot && collection.state === 'ok' &&
+    ageSeconds(snapshot.timestamp, now) >= -5 && ageSeconds(snapshot.timestamp, now) <= o.staleSeconds &&
+    wholeETA(snapshot, o, now).seconds !== null;
+}
+function breakHistory(now) {
+  // A failed first fetch after reload has no snapshot yet. Break persisted spans
+  // for this source too, so a short outage cannot disappear on reconnection.
+  const candidates = snapshot ? [historyRun()].filter(Boolean) :
+    (history.sources.find(s => s.key === sourceKey)?.runs || []);
+  let changed = false;
+  for (const run of candidates) {
+    if (!run.gap && !run.points.some(p => p.terminal)) { run.gap = true; changed = true; }
+  }
+  if (changed) saveHistory(now);
+}
+function observeHistory(o, now) {
+  if (!historyValid(o, now)) { breakHistory(now); return; }
+  const run = historyRun(true);
+  const success = snapshot.state === 'succeeded';
+  const estimate = success ? 'terminal-success' : JSON.stringify(snapshot.tasks
+    .filter(t => t.state !== 'succeeded')
+    .map(t => [t.id, t.eta.updated_at, t.eta.remaining_seconds]));
+  const last = run.points[run.points.length - 1];
+  const gap = run.gap || (run.lastObserved > 0 && now - run.lastObserved > GAP_MS);
+  run.lastObserved = now;
+  // Heartbeats and seq alone never create a new estimate. Success is recorded once.
+  if (!run.points.some(p => p.terminal) && !run.points.some(p => p.estimate === estimate) &&
+      (!last || now > last.t)) {
+    run.points.push({ t: now, seconds: wholeETA(snapshot, o, now).seconds,
+      estimate, gap, terminal: success });
+    run.gap = false;
+  } else if (gap) run.gap = true;
+  saveHistory(now);
+}
+function historySeries(points) {
+  const series = [];
+  for (const point of points) {
+    if (!series.length || point.gap) series.push({ name: '剩余分钟', color: 'accent', points: [] });
+    series[series.length - 1].points.push({ x: point.t, y: point.seconds / 60,
+      valueLabel: `${Math.round(point.seconds / 6) / 10} 分钟` });
+  }
+  return series;
+}
+function historyPanel(now) {
+  const run = historyRun();
+  const points = run ? run.points.filter(p => p.t >= now - RETENTION_MS) : [];
+  const note = storageNotice || (points.length ? '本机观测 · 中断处断线' : '等待有效 ETA 观测');
+  return column([
+    row([text('剩余时间曲线 · 分钟', { fontSize: 11, color: 'textMuted', grow: 1 }),
+      text('最近 24 小时', { fontSize: 10, color: 'textMuted' })]),
+    ...(points.length ? [{ type: 'Chart', props: {
+      type: 'line', height: 102, xKind: 'time', curve: 'linear',
+      series: historySeries(points), xTicks: 3, yTicks: 3,
+      yDomain: [0, Math.max(1, ...points.map(p => p.seconds / 60)) * 1.1],
+      xDomain: [points[0].t - (points.length === 1 ? 30000 : 0), Math.max(now, points[0].t + 1000)],
+      dots: true, grid: true, legend: false, hover: true, appear: false
+    } }] : []),
+    text(note, { fontSize: 10, color: storageNotice ? 'warning' : 'textMuted' })
+  ], { gap: 4, fillWidth: true });
 }
 function nativeTextStyle(props) {
   // Metrix.Bar 0.1.2 exposes textColor, rather than the newer docs' color alias.
@@ -241,6 +392,7 @@ export default {
     if (o.mode === 'demo' && !snapshot) {
       snapshot = makeDemo(o);
       collectDemo();
+      observeHistory(o, Date.now());
     }
     const now = Date.now();
     const stale = snapshot && ageSeconds(snapshot.timestamp, now) > o.staleSeconds;
@@ -252,6 +404,7 @@ export default {
     const notice = [interrupted ? '观测中断' : null, stale ? '数据过期' : null,
       clockAnomaly ? '源时间异常' : null, frozen ? '估计已冻结' : null,
       stoppedRun ? '已停止' : snapshot && snapshot.error ? '任务错误' : null].filter(Boolean).join(' · ');
+    if (!historyValid(o, now)) breakHistory(now);
     const progress = totalProgress(snapshot);
     const percentage = progress ? `${Math.round(progress.ratio * 100)}%` : '未知';
     const active = snapshot ? snapshot.tasks.findIndex(t => t.state === 'running') : -1;
@@ -296,9 +449,10 @@ export default {
         ], { gap: 7, grow: 1 })]),
         ...(notice ? [text(notice, { fontSize: 11, color: stoppedRun || interrupted ? 'danger' : 'warning' })] : []),
         { type: 'Scroll', props: { grow: 1, minHeight: 0, fillWidth: true }, children: [column(body, { gap: 16, fillWidth: true })] },
+        historyPanel(now),
         row([text('30 秒刷新', { fontSize: 11, color: 'textMuted', grow: 1 }),
           { type: 'Button', props: { text: '刷新', onClick: async () => { await update(env); } } }])
-      ], { preferredWidth: 360, preferredHeight: 470, fill: true, minHeight: 0, padding: 16, gap: 12 })
+      ], { preferredWidth: 360, preferredHeight: 610, fill: true, minHeight: 0, padding: 16, gap: 12 })
     };
   }
 };

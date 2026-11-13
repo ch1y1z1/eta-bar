@@ -2,12 +2,12 @@
 
 用 Go 只读采集 JSONL 实验进度，在原生 Metrix.Bar 面板显示串行阶段进度与剩余时间。前端不需要网页、npm 或浏览器服务。仓库示例完全合成，不代表真实实验。
 
-默认离线 demo：三阶段各 50 step，完成量为 50、17、0；整体 **67/150 ≈ 45%**，剩余预算 **23 分钟**。圆环按各阶段 total 分段，只有一个刷新按钮；前端每 30 秒刷新，刷新不推进工作量。
+默认离线 demo：三阶段各 50 step，完成量为 50、17、0；整体 **67/150 ≈ 45%**，剩余预算 **23 分钟**。圆环按各阶段 total 分段，只有一个刷新按钮；前端每 30 秒刷新，刷新不推进工作量。阶段列表下方的原生 ETA 曲线按真实观测时间绘制，并在 Mac 本机保留有界历史；默认 demo 的固定预算形成水平线。
 
 ## 项目结构
 
 - `cmd/eta-server`、`internal/backend`：Go 标准库 HTTP 服务、local/SSH 采集器及测试；module 为 `eta-bar`，Go 1.25。
-- `frontend/eta.bar`：[原生面板](frontend/README.md)，ID `eta-sequential-prototype`，版本 `0.2.2`。
+- `frontend/eta.bar`：[原生面板](frontend/README.md)，ID `eta-sequential-prototype`，版本 `0.3.0`。
 - `schema/snapshot.schema.json`、[协议说明](docs/protocol.md)：快照格式、采集及 API 契约。
 - `examples/demo/monitor.jsonl`：固定 UTC 时间的合成快照。
 - `examples/demo/record.py`：生成新鲜合成心跳，支持 `--once`；`write_log.py` 保留同样入口。
@@ -92,6 +92,8 @@ Mac 原生应用接入 WSL 时设置 `mode=api`，`baseURL` 为 Mac 可达的后
 
 仅支持串行任务；跨 unit 不汇总工作量，total 未知时不绘制整体圆环。ETA 依赖源端显式报告，不按进度比例推算或本地倒计时。源心跳与 ETA 各有独立有效期，默认 120 秒；断连或过期保留最后快照并冻结。记录器普通心跳不刷新 ETA 时间，合成 demo 明确重申固定预算。
 
+前端 0.3.0 通过声明 `apis="localStorage"` 使用 dashboard 本地 localStorage 保存最近 24 小时 ETA 采样；每尝试最多 720 点、每源最多 8 个 run/attempt、最多 8 源，并限制序列化容量。源及 run/attempt 隔离，旧请求不能覆盖新源历史。失效观测及超过 120 秒的观测空窗断线，不以冻结 ETA 补点；仅确认成功追加一次零。存储失败显示会话状态且不影响实时进度。历史仅来自应用实际观测，不能回填离线期间；详细规则和运行时契约见 [frontend README](frontend/README.md#本机-eta-历史030)。后端及 API 不变。
+
 ## 验证
 
 ```sh
@@ -101,7 +103,7 @@ go build -o /tmp/eta-server ./cmd/eta-server
 node --test frontend/eta.test.mjs
 ```
 
-Node 测试使用内置 test/vm 模块，无需 npm；检查路径请求、原生 secret、源切换与旧请求隔离，以及旧路由和 demo。Go 测试覆盖根授权、符号链接逃逸、SSH 固定脚本、生命周期、失败缓存隔离及 LRU 上限。Metrix.Bar 应用内解析与运行检查由安装环境执行。
+Node 测试使用内置 test/vm 模块，无需 npm；检查路径请求、原生 secret、旧路由、demo、ETA 时间/值去重、真实时间横轴、未知/过期/断连断线、终态零值、源与 attempt 隔离、Worker 重载、损坏/不可用/超额存储、有界保留及 A→B→A 异步请求隔离。Go 测试覆盖根授权、符号链接逃逸、SSH 固定脚本、生命周期、失败缓存隔离及 LRU 上限。Metrix.Bar 应用内解析与运行检查由安装环境执行。
 
 ## 许可
 
